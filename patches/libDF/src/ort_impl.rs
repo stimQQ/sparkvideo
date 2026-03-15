@@ -45,6 +45,51 @@ fn calc_norm_alpha(sr: usize, hop_size: usize, tau: f32) -> f32 {
     a
 }
 
+fn high_shelf(samples: &mut [f32], sr: usize, freq: f32, gain_db: f32) {
+    let a = 10f64.powf(gain_db as f64 / 40.0);
+    let w0 = 2.0 * std::f64::consts::PI * freq as f64 / sr as f64;
+    let cos_w0 = w0.cos();
+    let sin_w0 = w0.sin();
+    let alpha = sin_w0 / 2.0 * (2.0f64).sqrt();
+    let sq_a = a.sqrt();
+
+    let b0 = a * ((a + 1.0) + (a - 1.0) * cos_w0 + 2.0 * sq_a * alpha);
+    let b1 = -2.0 * a * ((a - 1.0) + (a + 1.0) * cos_w0);
+    let b2 = a * ((a + 1.0) + (a - 1.0) * cos_w0 - 2.0 * sq_a * alpha);
+    let a0 = (a + 1.0) - (a - 1.0) * cos_w0 + 2.0 * sq_a * alpha;
+    let a1 = 2.0 * ((a - 1.0) - (a + 1.0) * cos_w0);
+    let a2 = (a + 1.0) - (a - 1.0) * cos_w0 - 2.0 * sq_a * alpha;
+
+    let b0 = b0 / a0;
+    let b1 = b1 / a0;
+    let b2 = b2 / a0;
+    let a1 = a1 / a0;
+    let a2 = a2 / a0;
+
+    let mut x1 = 0.0f64;
+    let mut x2 = 0.0f64;
+    let mut y1 = 0.0f64;
+    let mut y2 = 0.0f64;
+
+    for s in samples.iter_mut() {
+        let x0 = *s as f64;
+        let y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+        x2 = x1;
+        x1 = x0;
+        y2 = y1;
+        y1 = y0;
+        *s = y0 as f32;
+    }
+}
+
+fn rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f64 = samples.iter().map(|&s| (s as f64) * (s as f64)).sum();
+    (sum_sq / samples.len() as f64).sqrt() as f32
+}
+
 impl DfOrt {
     pub fn new(dfp: DfParams, rp: &RuntimeParams) -> Result<Self> {
         let config = &dfp.config;
@@ -326,8 +371,20 @@ impl DfOrt {
             synth_state.synthesis(&mut spec, out_frame);
         }
 
-        eprintln!("[DfOrt] Done: {} frames (ERB={}, DF={}, zero_mask={}, skip={})",
-            n_frames, erb_count, df_count, zero_count, skip_count);
+        let input_rms = rms(noisy_mono);
+        let output_rms = rms(&output);
+        if input_rms > 1e-8 && output_rms > 1e-8 {
+            let gain = input_rms / output_rms;
+            for s in output.iter_mut() {
+                *s *= gain;
+            }
+        }
+
+        high_shelf(&mut output, sr, 3000.0, 4.0);
+
+        eprintln!("[DfOrt] Done: {} frames (ERB={}, DF={}, zero_mask={}, skip={}), gain_comp={:.2}x, hi_shelf=+4dB@3kHz",
+            n_frames, erb_count, df_count, zero_count, skip_count,
+            if output_rms > 1e-8 { input_rms / output_rms } else { 1.0 });
 
         Ok(output)
     }
